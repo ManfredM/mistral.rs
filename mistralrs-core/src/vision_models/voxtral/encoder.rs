@@ -296,8 +296,18 @@ impl VoxtralEncoder {
     /// Input: mel features [B, T, mel_bins]
     /// Output: [B, T/2, dim]
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let (b_sz, _t, _mel) = xs.dims3()?;
+        let conv = self.convolve(xs)?;
+        self.encode_new(&conv)
+    }
 
+    /// The two causal convolutions, without the transformer.
+    /// Input: mel features [B, T, mel_bins]; output: conv frames [B, T/2, dim]
+    /// in the model dtype, ready for [`Self::encode_new`].
+    ///
+    /// Both convolutions are causal (left-padded), so recomputing them over the
+    /// full mel history always reproduces earlier frames exactly: frame `j` of
+    /// the output only depends on mel frames `..=2*j+1`.
+    pub fn convolve(&self, xs: &Tensor) -> Result<Tensor> {
         let xs = xs.to_dtype(DType::F32)?;
 
         // Transpose [B, T, mel] -> [B, mel, T] for Conv1d
@@ -315,14 +325,28 @@ impl VoxtralEncoder {
         // Transpose back [B, dim, T/2] -> [B, T/2, dim]
         let xs = xs.transpose(1, 2)?.contiguous()?;
         // Cast from F32 to model dtype for transformer layers
-        let xs = xs.to_dtype(self.model_dtype)?;
+        xs.to_dtype(self.model_dtype)
+    }
 
-        let seq_len = xs.dim(1)?;
+    /// Run the transformer over conv frames that have not been encoded yet,
+    /// appending to the persistent KV cache. RoPE positions continue from the
+    /// number of frames already in the cache, so feeding a clip in chunks is
+    /// equivalent to feeding it at once (the attention is causal).
+    /// Input: conv frames [B, S, dim]; output: [B, S, dim].
+    pub fn encode_new(&self, xs: &Tensor) -> Result<Tensor> {
+        let (b_sz, seq_len, _dim) = xs.dims3()?;
 
         let mut cache = self.cache.lock().expect("Encoder cache lock poisoned");
+        let past = cache.0[0].current_seq_len();
+
+        // Per-token RoPE positions: past..past+seq_len for each batch row.
+        let mut pos = Vec::with_capacity(b_sz * seq_len);
+        for _ in 0..b_sz {
+            pos.extend((past..past + seq_len).map(|p| p as u32));
+        }
+        let positions = Tensor::from_vec(pos, b_sz * seq_len, xs.device())?;
 
         // Create causal mask with sliding window for the encoder
-        let positions = Tensor::from_vec(vec![0u32; b_sz], b_sz, xs.device())?;
         let dummy_toks = Tensor::zeros((b_sz, seq_len), DType::U32, xs.device())?;
         let attention_mask = CausalMasker.make_causal_mask(
             &dummy_toks,
@@ -334,7 +358,7 @@ impl VoxtralEncoder {
             },
         )?;
 
-        let mut hidden = xs;
+        let mut hidden = xs.clone();
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, &attention_mask, &positions, &mut cache.0[i])?;
         }
