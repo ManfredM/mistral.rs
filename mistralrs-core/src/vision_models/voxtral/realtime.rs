@@ -7,11 +7,18 @@
 //!
 //! - mel frames are final once their sample window is available
 //!   ([`MelFrameEngine::ready_frames`]),
-//! - conv frames only look left (causal convolutions, recomputed over the full
-//!   mel history and sliced),
+//! - conv frames only look left (causal convolutions, advanced incrementally
+//!   with a carried context of a few frames — [`StreamingConvState`]),
 //! - encoder frames only attend left (appending KV cache),
 //! - adapter groups are independent per group of 4 encoder frames,
 //! - a decoder forward at position `p` only needs audio embeddings `..=p`.
+//!
+//! Every per-feed cost is bounded by the feed, not the session: raw samples
+//! are trimmed to the window future mel frames can read, the convolutions
+//! carry O(1) context, audio embeddings are appended as segments (and evicted
+//! once consumed) instead of re-concatenated, and detokenization decodes a
+//! fixed tail window of ids. A session therefore keeps real-time pace
+//! regardless of how long the speaker dictates.
 //!
 //! The session drives exactly the same decoder entry point as whole-clip
 //! generation (the audio-embedding-conditioned generation branch of
@@ -32,10 +39,11 @@ use crate::pipeline::{
 use super::audio_processing::{
     MelFrameEngine, VoxtralAudioProcessor, N_LEFT_PAD_TOKENS, N_RIGHT_PAD_TOKENS,
 };
+use super::encoder::StreamingConvState;
 use super::inputs_processor::{
     AUDIO_LENGTH_PER_TOK, BOS_TOKEN_ID, N_DELAY_TOKENS, STREAMING_PAD_TOKEN_ID,
 };
-use super::{VoxtralModel, VoxtralSpecificArgs};
+use super::{AudioEmbedStore, VoxtralModel, VoxtralSpecificArgs};
 
 /// Decoder prompt length: `[BOS]` + `(32 left-pad + 6 delay)` streaming pads.
 const N_PROMPT_TOKENS: usize = 1 + N_LEFT_PAD_TOKENS + N_DELAY_TOKENS;
@@ -54,20 +62,19 @@ pub struct VoxtralAsrSession {
     mel_engine: MelFrameEngine,
     num_mel_bins: usize,
     samples_per_token: usize,
-    /// Raw 16 kHz mono sample buffer; starts with the 32-token left pad of silence.
+    /// Retained raw 16 kHz mono samples: the bounded suffix of the global
+    /// stream that future mel frames can still read (`samples[0]` is global
+    /// sample index `samples_base`). The stream starts with the 32-token left
+    /// pad of silence.
     samples: Vec<f32>,
-    /// All mel frames computed so far, flattened `[frame][mel_bin]`.
-    mel_flat: Vec<f32>,
-    /// Number of mel frames in `mel_flat`.
+    samples_base: usize,
+    /// Number of mel frames computed so far.
     mel_done: usize,
-    /// Conv frames already pushed through the encoder transformer (== the
-    /// total ever appended to its KV cache; the cache retains only the last
-    /// 750 once the sliding window saturates).
-    conv_done: usize,
+    /// Carried context of the two causal convolutions (a few frames).
+    conv_state: StreamingConvState,
     /// Encoder output frames awaiting a complete adapter group of 4.
     enc_pending: Option<Tensor>,
-    /// Accumulated audio embeddings `[1, N, dim]`.
-    embeds: Option<Tensor>,
+    /// Number of audio embeddings accumulated in the model's embed store.
     n_embeds: usize,
     downsample: usize,
     prompt_fed: bool,
@@ -76,8 +83,11 @@ pub struct VoxtralAsrSession {
     /// Generated token ids (EOS excluded), in order.
     gen_ids: Vec<u32>,
     hit_eos: bool,
-    /// Decoded text already returned to the caller.
-    emitted: String,
+    /// Detokenization window: ids before `win_start` have left the window and
+    /// their text is committed (immutable, already emitted); `emitted_win` is
+    /// the text already emitted for ids at or after `win_start`.
+    win_start: usize,
+    emitted_win: String,
 }
 
 fn voxtral_of(pipeline: &dyn Pipeline) -> Result<&VoxtralModel> {
@@ -164,18 +174,18 @@ impl VoxtralAsrSession {
             num_mel_bins,
             samples_per_token,
             samples: vec![0.0f32; N_LEFT_PAD_TOKENS * samples_per_token],
-            mel_flat: Vec::new(),
+            samples_base: 0,
             mel_done: 0,
-            conv_done: 0,
+            conv_state: StreamingConvState::new(),
             enc_pending: None,
-            embeds: None,
             n_embeds: 0,
             downsample,
             prompt_fed: false,
             tokens_fed: 0,
             gen_ids: Vec::new(),
             hit_eos: false,
-            emitted: String::new(),
+            win_start: 0,
+            emitted_win: String::new(),
         })
     }
 
@@ -187,9 +197,19 @@ impl VoxtralAsrSession {
         let model = voxtral_of(&*guard)?;
 
         self.samples.extend_from_slice(pcm);
-        self.advance_mel(false);
-        self.advance_encoder(model)?;
+        let new_mel = self.advance_mel(false);
+        self.advance_encoder(model, new_mel)?;
         self.advance_decoder(model, None)?;
+        // Embeddings at positions the decoder has consumed are never read
+        // again; drop them so session memory stays bounded too.
+        if let Some(store) = model
+            .audio_embeds_cache
+            .lock()
+            .expect("audio_embeds_cache lock")
+            .as_mut()
+        {
+            store.evict_below(self.tokens_fed);
+        }
         self.take_delta()
     }
 
@@ -204,8 +224,8 @@ impl VoxtralAsrSession {
             0.0f32,
             N_RIGHT_PAD_TOKENS * self.samples_per_token,
         ));
-        self.advance_mel(true);
-        self.advance_encoder(model)?;
+        let new_mel = self.advance_mel(true);
+        self.advance_encoder(model, new_mel)?;
 
         // Whole-clip generation cap: ceil(mel_frames / 8) - right-pad tokens.
         let cap = self
@@ -223,49 +243,64 @@ impl VoxtralAsrSession {
         Ok(tail)
     }
 
-    /// Compute all mel frames that are final. During streaming only frames whose
-    /// full sample window exists are computed; at finish the remaining frames are
-    /// computed with reflection at the (now final) clip end, exactly like the
-    /// whole-clip path.
-    fn advance_mel(&mut self, clip_complete: bool) {
+    /// Compute all mel frames that are final and return them (flattened
+    /// `[frame][mel_bin]`). During streaming only frames whose full sample
+    /// window exists are computed; at finish the remaining frames are computed
+    /// with reflection at the (now final) clip end, exactly like the
+    /// whole-clip path. Afterwards, raw samples no future frame can read are
+    /// dropped, so the retained buffer stays bounded regardless of session
+    /// length.
+    fn advance_mel(&mut self, clip_complete: bool) -> Vec<f32> {
+        let glen = self.samples_base + self.samples.len();
         let target = if clip_complete {
-            self.mel_engine.total_frames(self.samples.len())
+            self.mel_engine.total_frames(glen)
         } else {
-            self.mel_engine.ready_frames(self.samples.len())
+            self.mel_engine.ready_frames(glen)
         };
-        if target > self.mel_done {
-            let new = self
-                .mel_engine
-                .compute_frames(&self.samples, self.mel_done, target, clip_complete);
-            self.mel_flat.extend(new);
+        let new = if target > self.mel_done {
+            let out = self.mel_engine.compute_frames(
+                &self.samples,
+                self.samples_base,
+                self.mel_done,
+                target,
+                clip_complete,
+            );
             self.mel_done = target;
+            out
+        } else {
+            Vec::new()
+        };
+
+        let keep_from = self.mel_engine.retained_from(self.mel_done);
+        if keep_from > self.samples_base {
+            self.samples.drain(..keep_from - self.samples_base);
+            self.samples_base = keep_from;
         }
+
+        new
     }
 
-    /// Push newly final conv frames through the encoder transformer and complete
-    /// adapter groups into the accumulated audio embeddings.
-    fn advance_encoder(&mut self, model: &VoxtralModel) -> Result<()> {
-        // Conv frame j depends on mel frames ..=2j+1, so with M mel frames the
-        // first M/2 conv frames are final. The convolutions are cheap; recompute
-        // them over the full history and slice the new frames for exactness.
-        let target_conv = self.mel_done / 2;
-        if target_conv > self.conv_done {
+    /// Push newly final mel frames through the convolutions (incrementally,
+    /// with carried context), new conv frames through the encoder transformer,
+    /// and complete adapter groups into the model's audio embedding store.
+    fn advance_encoder(&mut self, model: &VoxtralModel, new_mel: Vec<f32>) -> Result<()> {
+        // Conv frame j depends on mel frames ..=2j+1; the incremental
+        // convolution emits exactly the frames whose full window now exists
+        // and carries the remainders, so each feed costs O(new mel frames).
+        if !new_mel.is_empty() {
             let device = MultimodalModel::device(model);
-            let mel = Tensor::from_vec(
-                self.mel_flat.clone(),
-                (1, self.mel_done, self.num_mel_bins),
-                device,
-            )?;
-            let conv_all = model.encoder.convolve(&mel)?;
-            let new = conv_all
-                .narrow(1, self.conv_done, target_conv - self.conv_done)?
-                .contiguous()?;
-            let enc_out = model.encoder.encode_new(&new)?;
-            self.conv_done = target_conv;
-            self.enc_pending = Some(match self.enc_pending.take() {
-                Some(prev) => Tensor::cat(&[&prev, &enc_out], 1)?,
-                None => enc_out,
-            });
+            let m = new_mel.len() / self.num_mel_bins;
+            let mel = Tensor::from_vec(new_mel, (1, m, self.num_mel_bins), device)?;
+            if let Some(conv_new) = model
+                .encoder
+                .convolve_incremental(&mel, &mut self.conv_state)?
+            {
+                let enc_out = model.encoder.encode_new(&conv_new)?;
+                self.enc_pending = Some(match self.enc_pending.take() {
+                    Some(prev) => Tensor::cat(&[&prev, &enc_out], 1)?,
+                    None => enc_out,
+                });
+            }
         }
 
         // Adapter: complete groups of `downsample` encoder frames only; the
@@ -276,16 +311,18 @@ impl VoxtralAsrSession {
             if n_grouped > 0 {
                 let grouped = pending.narrow(1, 0, n_grouped)?.contiguous()?;
                 let new_embeds = model.adapter.forward(&grouped)?.to_dtype(model.dtype)?;
-                let embeds = match self.embeds.take() {
-                    Some(prev) => Tensor::cat(&[&prev, &new_embeds], 1)?,
-                    None => new_embeds,
-                };
-                self.n_embeds = embeds.dim(1)?;
-                *model
+                let n_new = new_embeds.dim(1)?;
+                // Append as a fresh segment: O(new embeddings) per feed, no
+                // re-copy of the session's embedding history.
+                let mut store = model
                     .audio_embeds_cache
                     .lock()
-                    .expect("audio_embeds_cache lock") = Some(embeds.clone());
-                self.embeds = Some(embeds);
+                    .expect("audio_embeds_cache lock");
+                match store.as_mut() {
+                    Some(store) => store.push(new_embeds)?,
+                    None => *store = Some(AudioEmbedStore::from_single(new_embeds)?),
+                }
+                self.n_embeds += n_new;
             }
             if n_grouped < n {
                 self.enc_pending = Some(pending.narrow(1, n_grouped, n - n_grouped)?.contiguous()?);
@@ -370,30 +407,65 @@ impl VoxtralAsrSession {
         Ok(())
     }
 
-    /// Decode all generated ids and return the not-yet-emitted suffix. Decoding
-    /// from scratch each time keeps deltas correct across BPE merge boundaries.
+    /// How many generated ids the detokenization window keeps. Ids that leave
+    /// the window have immutable, already-emitted text by construction, so
+    /// each round decodes a bounded number of ids however long the session.
+    const DELTA_WINDOW: usize = 64;
+
+    /// Decode the tail window of generated ids and return the not-yet-emitted
+    /// suffix. Re-decoding the window (rather than single tokens) keeps deltas
+    /// correct across BPE merge boundaries and partial UTF-8 sequences at the
+    /// tail, exactly as decoding from scratch did; the window start only ever
+    /// moves at an id whose text boundary is verified clean, so text ahead of
+    /// the window can never change.
     fn take_delta(&mut self) -> Result<String> {
-        let full = self
-            .tokenizer
-            .decode(&self.gen_ids, true)
-            .map_err(|e| anyhow!("detokenization failed: {e}"))
-            .context("decoding streaming ASR output")?;
-        let delta = match full.strip_prefix(self.emitted.as_str()) {
+        let window_text = self.decode_from(self.win_start)?;
+        let delta = match window_text.strip_prefix(self.emitted_win.as_str()) {
             Some(rest) => rest.to_string(),
             None => {
                 // A rare re-decode changed already-emitted text; emit from the
                 // longest common prefix (the caller cannot retract text).
                 let common = self
-                    .emitted
+                    .emitted_win
                     .char_indices()
-                    .zip(full.chars())
+                    .zip(window_text.chars())
                     .find(|((_, a), b)| a != b)
                     .map(|((idx, _), _)| idx)
-                    .unwrap_or_else(|| self.emitted.len().min(full.len()));
-                full[common..].to_string()
+                    .unwrap_or_else(|| self.emitted_win.len().min(window_text.len()));
+                window_text[common..].to_string()
             }
         };
-        self.emitted = full;
+        self.emitted_win = window_text;
+
+        // Slide the window start forward once it exceeds the bound — but only
+        // at an id where the boundary is clean: the shorter window must decode
+        // to a suffix of the emitted window text, so the text moving out of
+        // the window is exactly what was already emitted for those ids. If a
+        // UTF-8 character spans the preferred boundary, a nearby id aligns (a
+        // character is at most a few tokens); until one does, the window
+        // simply stays a little longer.
+        if self.gen_ids.len() - self.win_start > Self::DELTA_WINDOW {
+            let target = self.gen_ids.len() - Self::DELTA_WINDOW;
+            let lowest = target.saturating_sub(3).max(self.win_start + 1);
+            for new_start in (lowest..=target).rev() {
+                let rest = self.decode_from(new_start)?;
+                if self.emitted_win.ends_with(rest.as_str()) {
+                    self.emitted_win = rest;
+                    self.win_start = new_start;
+                    break;
+                }
+            }
+        }
+
         Ok(delta)
+    }
+
+    /// Decode `gen_ids[from..]`, skipping special tokens (utterance-boundary
+    /// EOS ids stay in context but never become text).
+    fn decode_from(&self, from: usize) -> Result<String> {
+        self.tokenizer
+            .decode(&self.gen_ids[from..], true)
+            .map_err(|e| anyhow!("detokenization failed: {e}"))
+            .context("decoding streaming ASR output")
     }
 }

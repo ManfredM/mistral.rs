@@ -211,6 +211,84 @@ impl EncoderLayer {
     }
 }
 
+/// Carried state for the incremental streaming convolution
+/// ([`VoxtralEncoder::convolve_incremental`]).
+///
+/// Both convolutions are causal, so a chunk's output frames only need a fixed
+/// amount of left context: conv1 (kernel 3, stride 1, left pad 2) needs the
+/// previous 2 mel frames, and conv2 (kernel 3, stride 2, left pad 1) needs the
+/// unconsumed tail of the conv1 output stream. Carrying exactly that context
+/// makes the per-chunk cost proportional to the chunk, not the session, while
+/// staying bit-identical to convolving the whole history at once.
+pub struct StreamingConvState {
+    /// The last 2 raw input frames fed to conv1, `[1, in_ch, 2]` (F32).
+    /// `None` before the first chunk: the causal left pad of 2 zero frames.
+    conv1_tail: Option<Tensor>,
+    /// Conv1 output frames (post-GELU) not yet consumed by conv2,
+    /// `[1, ch, 1..=2]` (F32). `None` before the first chunk: the causal left
+    /// pad of 1 zero frame. The buffer's first frame always sits at an even
+    /// index of the padded conv1 output stream, so conv2's stride-2 grid over
+    /// the buffer lands exactly where the whole-clip computation puts it.
+    conv2_buf: Option<Tensor>,
+}
+
+impl StreamingConvState {
+    pub fn new() -> Self {
+        Self {
+            conv1_tail: None,
+            conv2_buf: None,
+        }
+    }
+
+    /// Push `new` input frames (`[1, in_ch, m]`, F32) through the two causal
+    /// convolutions, returning every output frame that is now final
+    /// (`[1, out_ch, n]`, post-GELU, possibly `n == 0`) and carrying the
+    /// remainders. Feeding a stream in chunks yields, concatenated, exactly
+    /// the frames the one-shot pad-and-convolve computation yields.
+    fn advance(
+        &mut self,
+        conv1: &candle_nn::Conv1d,
+        conv2: &candle_nn::Conv1d,
+        new: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        if new.dim(2)? == 0 {
+            return Ok(None);
+        }
+
+        // Conv1: [carried 2-frame tail | new] -> exactly `m` final frames.
+        let c1_in = match self.conv1_tail.take() {
+            Some(tail) => Tensor::cat(&[&tail, new], 2)?,
+            None => new.pad_with_zeros(2, 2, 0)?,
+        };
+        let w = c1_in.dim(2)?;
+        self.conv1_tail = Some(c1_in.narrow(2, w - 2, 2)?.contiguous()?);
+        let c1_out = conv1.forward(&c1_in.contiguous()?)?.gelu_erf()?;
+
+        // Conv2: [carried tail | conv1 frames]; a window is final once all 3
+        // of its inputs exist, and consuming 2 per output preserves the
+        // stride-2 grid alignment across chunk boundaries.
+        let buf = match self.conv2_buf.take() {
+            Some(prev) => Tensor::cat(&[&prev, &c1_out], 2)?,
+            None => c1_out.pad_with_zeros(2, 1, 0)?,
+        };
+        let l = buf.dim(2)?;
+        if l < 3 {
+            self.conv2_buf = Some(buf);
+            return Ok(None);
+        }
+        let n_out = (l - 3) / 2 + 1;
+        let out = conv2.forward(&buf.contiguous()?)?.gelu_erf()?;
+        self.conv2_buf = Some(buf.narrow(2, 2 * n_out, l - 2 * n_out)?.contiguous()?);
+        Ok(Some(out))
+    }
+}
+
+impl Default for StreamingConvState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Causal Whisper-based audio encoder for Voxtral.
 ///
 /// Unlike standard Whisper, this uses:
@@ -342,6 +420,29 @@ impl VoxtralEncoder {
         xs.to_dtype(self.model_dtype)
     }
 
+    /// Incremental counterpart of [`Self::convolve`]: push only the newly
+    /// final mel frames through both convolutions, carrying the bounded left
+    /// context in `state`. Per-call cost is proportional to the chunk, not the
+    /// mel history, and the concatenated outputs are identical to
+    /// [`Self::convolve`] over the whole history.
+    /// Input: new mel frames [B, m, mel_bins]; output: the conv frames that
+    /// are now final, [B, n, dim] in the model dtype (possibly none).
+    pub fn convolve_incremental(
+        &self,
+        mel_new: &Tensor,
+        state: &mut StreamingConvState,
+    ) -> Result<Option<Tensor>> {
+        let xs = mel_new.to_dtype(DType::F32)?.transpose(1, 2)?;
+        match state.advance(&self.conv1, &self.conv2, &xs)? {
+            Some(out) => Ok(Some(
+                out.transpose(1, 2)?
+                    .contiguous()?
+                    .to_dtype(self.model_dtype)?,
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Run the transformer over conv frames that have not been encoded yet,
     /// appending to the persistent KV cache. RoPE positions continue from the
     /// number of frames already in the cache, so feeding a clip in chunks is
@@ -426,5 +527,129 @@ impl VoxtralEncoder {
         let fresh = NormalCache::new_sliding(self.n_layers, 1_000_000, self.sliding_window);
         let inner = fresh.lock().expect("New cache lock poisoned").clone();
         *self.cache.lock().expect("Encoder cache lock poisoned") = inner;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    /// Deterministic pseudo-random conv weights (no model download needed).
+    fn test_conv(
+        out_ch: usize,
+        in_ch: usize,
+        stride: usize,
+        seed: u32,
+        device: &Device,
+    ) -> candle_nn::Conv1d {
+        let n = out_ch * in_ch * 3;
+        let mut state = seed;
+        let mut next = || {
+            // xorshift32; values in roughly [-0.5, 0.5]
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state as f32 / u32::MAX as f32) - 0.5
+        };
+        let weight: Vec<f32> = (0..n).map(|_| next()).collect();
+        let bias: Vec<f32> = (0..out_ch).map(|_| next()).collect();
+        candle_nn::Conv1d::new(
+            Tensor::from_vec(weight, (out_ch, in_ch, 3), device).unwrap(),
+            Some(Tensor::from_vec(bias, out_ch, device).unwrap()),
+            candle_nn::Conv1dConfig {
+                padding: 0,
+                stride,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Chunked incremental convolution must reproduce the one-shot
+    /// pad-and-convolve pipeline over the same frame stream, for chunk sizes
+    /// that hit every stride-parity and sub-kernel-carry case.
+    ///
+    /// The comparison uses a tight tolerance rather than bit equality: candle
+    /// lowers conv1d to im2col + gemm, whose accumulation order (and thus the
+    /// last ULP) legitimately varies with the call's width. Any alignment,
+    /// parity, or carry bug produces grossly different values, which this
+    /// still catches; end-to-end exactness on the real checkpoint is what the
+    /// streaming-vs-whole-clip transcript gate verifies.
+    #[test]
+    fn incremental_convolution_matches_whole_clip() {
+        let device = Device::Cpu;
+        let in_ch = 8;
+        let mid_ch = 6;
+        let out_ch = 6;
+        let conv1 = test_conv(mid_ch, in_ch, 1, 0x1234_5678, &device);
+        let conv2 = test_conv(out_ch, mid_ch, 2, 0x9abc_def1, &device);
+
+        let t_total = 137usize;
+        let mut vals = (0..in_ch * t_total).map(|i| ((i * 2654435761) % 1000) as f32 / 500.0 - 1.0);
+        let input = Tensor::from_vec(
+            (0..in_ch * t_total).map(|_| vals.next().unwrap()).collect(),
+            (1, in_ch, t_total),
+            &device,
+        )
+        .unwrap();
+
+        // Whole-clip reference: exactly VoxtralEncoder::convolve's pipeline.
+        let whole = {
+            let xs = input.pad_with_zeros(2, 2, 0).unwrap();
+            let xs = conv1.forward(&xs).unwrap().gelu_erf().unwrap();
+            let xs = xs.pad_with_zeros(2, 1, 0).unwrap();
+            conv2.forward(&xs).unwrap().gelu_erf().unwrap()
+        };
+        // Compare time-major so per-chunk outputs concatenate along time.
+        let whole_flat = whole
+            .transpose(1, 2)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        for chunk_sizes in [
+            vec![1usize; t_total],
+            vec![2; (t_total + 1) / 2],
+            vec![3; (t_total + 2) / 3],
+            vec![7, 1, 2, 5, 3, 1, 1, 4, 6, 2, 9, 1, 100],
+        ] {
+            let mut state = StreamingConvState::new();
+            let mut got: Vec<f32> = Vec::new();
+            let mut fed = 0usize;
+            for &sz in &chunk_sizes {
+                let take = sz.min(t_total - fed);
+                if take == 0 {
+                    break;
+                }
+                let chunk = input.narrow(2, fed, take).unwrap().contiguous().unwrap();
+                fed += take;
+                if let Some(out) = state.advance(&conv1, &conv2, &chunk).unwrap() {
+                    got.extend(
+                        out.transpose(1, 2)
+                            .unwrap()
+                            .flatten_all()
+                            .unwrap()
+                            .to_vec1::<f32>()
+                            .unwrap(),
+                    );
+                }
+            }
+            assert_eq!(fed, t_total);
+            // Both paths emit a frame only once its full 3-input window
+            // exists (padding 0), so the counts must match exactly.
+            assert_eq!(
+                got.len(),
+                whole_flat.len(),
+                "chunking {chunk_sizes:?}: frame count mismatch"
+            );
+            for (i, (a, b)) in got.iter().zip(whole_flat.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-5f32.max(b.abs() * 1e-5),
+                    "chunking {chunk_sizes:?}: conv output diverged at flat index {i}: {a} vs {b}"
+                );
+            }
+        }
     }
 }

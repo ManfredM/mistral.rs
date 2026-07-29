@@ -70,8 +70,24 @@ async fn main() -> Result<()> {
     let mut deltas: Vec<(usize, String)> = Vec::new();
     let n_chunks = samples.len().div_ceil(CHUNK_SAMPLES);
     let mut delta_before_last_chunk = false;
+    let mut window_started = std::time::Instant::now();
+    let mut window_means: Vec<f64> = Vec::new();
     for (i, chunk) in samples.chunks(CHUNK_SAMPLES).enumerate() {
         let delta = stream.feed(chunk).await?;
+        // Real-time budget check: each chunk is 100 ms of audio, so the
+        // mean feed cost per 100-chunk window must stay well under 100 ms
+        // or a live session falls ever further behind the speaker.
+        if (i + 1) % 100 == 0 {
+            let elapsed = window_started.elapsed();
+            let mean_ms = elapsed.as_secs_f64() * 10.0;
+            println!(
+                "pace  {:>4}: mean feed cost {:>6.1} ms over last 100 chunks",
+                i + 1,
+                mean_ms
+            );
+            window_means.push(mean_ms);
+            window_started = std::time::Instant::now();
+        }
         if !delta.is_empty() {
             println!("feed {:>3}/{n_chunks}: {delta:?}", i + 1);
             if i + 1 < n_chunks {
@@ -104,6 +120,26 @@ async fn main() -> Result<()> {
             "INCREMENTAL: first delta arrived at feed {}/{n_chunks}",
             deltas.first().map(|(i, _)| *i).unwrap_or(0)
         );
+    }
+    // Flat-pace gate for long clips: per-feed cost must not grow with session
+    // length (a dictation session of 30+ minutes has to keep real-time pace).
+    // With more than 1000 chunks, the last full 100-chunk window may cost at
+    // most 1.5x the warm baseline (windows 2-4; window 1 is warm-up).
+    if n_chunks > 1000 && window_means.len() >= 4 {
+        let baseline = window_means[1..4].iter().sum::<f64>() / 3.0;
+        let last = *window_means
+            .last()
+            .expect("window_means has at least 4 entries");
+        if last > 1.5 * baseline {
+            eprintln!(
+                "PACE NOT FLAT: last window mean {last:.1} ms exceeds 1.5x warm baseline {baseline:.1} ms"
+            );
+            failed = true;
+        } else {
+            println!(
+                "PACE FLAT: last window mean {last:.1} ms within 1.5x warm baseline {baseline:.1} ms"
+            );
+        }
     }
     if failed {
         std::process::exit(1);

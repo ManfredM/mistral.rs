@@ -320,6 +320,106 @@ impl DecoderLayer {
     }
 }
 
+/// Audio embeddings `[1, N, dim]` stored as appended segments.
+///
+/// The whole-clip path stores one segment, so its behavior (a single tensor,
+/// sliced per generation step) is unchanged. The streaming session appends a
+/// small segment whenever the adapter yields new groups; keeping segments
+/// instead of concatenating makes each append O(new frames) rather than
+/// O(session), and lets the session drop segments the decoder has consumed so
+/// memory stays bounded too. Positions are absolute for the whole session,
+/// eviction only discards, never renumbers.
+pub(crate) struct AudioEmbedStore {
+    /// Retained segments as `(absolute start position, tensor)`, in order.
+    segments: std::collections::VecDeque<(usize, Tensor)>,
+    /// Absolute total number of embedding positions ever stored.
+    total: usize,
+}
+
+impl AudioEmbedStore {
+    /// A store holding one segment — the whole-clip case.
+    pub(crate) fn from_single(t: Tensor) -> Result<Self> {
+        let n = t.dim(1)?;
+        Ok(Self {
+            segments: std::collections::VecDeque::from([(0, t)]),
+            total: n,
+        })
+    }
+
+    /// Append a segment of new embeddings; O(1) in the session length.
+    pub(crate) fn push(&mut self, t: Tensor) -> Result<()> {
+        let n = t.dim(1)?;
+        self.segments.push_back((self.total, t));
+        self.total += n;
+        Ok(())
+    }
+
+    /// Total number of embedding positions (independent of eviction).
+    pub(crate) fn total_len(&self) -> usize {
+        self.total
+    }
+
+    /// The slice at absolute positions `pos..pos + n`, `[1, n, dim]`.
+    /// A cheap narrow when the range lies in one segment (always, for the
+    /// single-token generation steps); a small cat when it spans segments
+    /// (the 39-token prompt prefill).
+    pub(crate) fn narrow(&self, pos: usize, n: usize) -> Result<Tensor> {
+        let first = self
+            .segments
+            .partition_point(|(start, _)| *start <= pos)
+            .checked_sub(1)
+            .ok_or_else(|| {
+                candle_core::Error::msg(format!(
+                    "audio embedding position {pos} was evicted or never stored"
+                ))
+            })?;
+        let mut parts: Vec<Tensor> = Vec::new();
+        let mut cur = pos;
+        let mut remaining = n;
+        for (start, seg) in self.segments.iter().skip(first) {
+            if remaining == 0 {
+                break;
+            }
+            let seg_len = seg.dim(1)?;
+            if cur < *start || cur >= start + seg_len {
+                candle_core::bail!(
+                    "audio embedding position {cur} not retained (segment starts at {start})"
+                );
+            }
+            let off = cur - start;
+            let take = remaining.min(seg_len - off);
+            parts.push(seg.narrow(1, off, take)?);
+            cur += take;
+            remaining -= take;
+        }
+        if remaining > 0 {
+            candle_core::bail!(
+                "audio embedding range {pos}..{} exceeds stored length {}",
+                pos + n,
+                self.total
+            );
+        }
+        if parts.len() == 1 {
+            Ok(parts.pop().expect("one part"))
+        } else {
+            Tensor::cat(&parts, 1)
+        }
+    }
+
+    /// Drop retained segments that end at or before `pos` (every position the
+    /// decoder has already consumed and will never read again).
+    pub(crate) fn evict_below(&mut self, pos: usize) {
+        while let Some((start, seg)) = self.segments.front() {
+            let end = start + seg.dim(1).unwrap_or(0);
+            if end <= pos {
+                self.segments.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct VoxtralSpecificArgs {
     pub mel_features: Option<Tensor>,
@@ -348,7 +448,9 @@ pub struct VoxtralModel {
     dtype: DType,
     /// Precomputed audio embeddings [B, N_audio, dim] stored during prompt phase
     /// and retrieved at each generation step for per-position audio conditioning.
-    audio_embeds_cache: Arc<Mutex<Option<Tensor>>>,
+    /// Whole-clip requests store a single segment; the streaming session appends
+    /// segments as audio arrives (see [`AudioEmbedStore`]).
+    audio_embeds_cache: Arc<Mutex<Option<AudioEmbedStore>>>,
     /// Audio front-end parameters, kept for the streaming ASR session.
     audio_cfg: config::AudioEncodingArgs,
 }
@@ -544,7 +646,8 @@ impl VoxtralModel {
             *self
                 .audio_embeds_cache
                 .lock()
-                .expect("audio_embeds_cache lock") = Some(audio_embeds.clone());
+                .expect("audio_embeds_cache lock") =
+                Some(AudioEmbedStore::from_single(audio_embeds.clone())?);
 
             // Add audio embeddings to text at overlapping positions (0..min(prompt_len, N_audio)).
             // Audio is left-padded with silence so positions 0..31 contain encoded silence
@@ -569,13 +672,13 @@ impl VoxtralModel {
                 .lock()
                 .expect("audio_embeds_cache lock");
             if let Some(ref audio_embeds) = *cache {
-                let audio_len = audio_embeds.dim(1)?;
+                let audio_len = audio_embeds.total_len();
                 let pos = ctx.seqlen_offsets()[0];
                 let seq_len = text_embeds.dim(1)?;
                 let end_pos = (pos + seq_len).min(audio_len);
                 if pos < end_pos {
                     let n = end_pos - pos;
-                    let audio_slice = audio_embeds.narrow(1, pos, n)?;
+                    let audio_slice = audio_embeds.narrow(pos, n)?;
                     let text_prefix = text_embeds.narrow(1, 0, n)?;
                     let combined = (text_prefix + audio_slice)?;
                     if n < seq_len {

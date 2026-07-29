@@ -65,16 +65,36 @@ impl MelFrameEngine {
         }
     }
 
-    /// Compute mel frames `start..end` over `samples`, returned as a flat
+    /// First global sample index any frame `>= frames_done` can still read.
+    /// Samples before this index may be discarded by a streaming caller.
+    ///
+    /// Frame `f` reads global samples `f*hop - n_fft/2 ..`, and the start
+    /// reflection (`s < 0`) only occurs for frames whose window begins before
+    /// sample 0 — frames that are necessarily already done once this value is
+    /// positive. The end reflection at finish reads back at most
+    /// `n_fft/2 + 1` samples from the clip end, which is always newer than
+    /// this bound for any not-yet-computed frame.
+    pub(super) fn retained_from(&self, frames_done: usize) -> usize {
+        (frames_done * self.hop).saturating_sub(self.n_fft / 2)
+    }
+
+    /// Compute mel frames `start..end`, returned as a flat
     /// `(end - start) * num_mel_bins` vector.
+    ///
+    /// `samples` is the retained suffix of the clip beginning at global sample
+    /// index `base` (whole-clip callers pass the full clip with `base == 0`);
+    /// the global clip length is `base + samples.len()`. Every sample a
+    /// requested frame reads must satisfy `global index >= base`
+    /// (see [`Self::retained_from`]).
     ///
     /// The clip start is reflection-padded (matching `torch.stft(center=True)`).
     /// If `reflect_right` is set, reads past the end reflect at the clip end as
     /// well (only valid once the clip is complete); otherwise every requested
-    /// frame must satisfy `frame*hop + n_fft/2 <= samples.len()`.
+    /// frame must satisfy `frame*hop + n_fft/2 <= base + samples.len()`.
     pub(super) fn compute_frames(
         &self,
         samples: &[f32],
+        base: usize,
         start: usize,
         end: usize,
         reflect_right: bool,
@@ -82,19 +102,24 @@ impl MelFrameEngine {
         let n_fft = self.n_fft;
         let pad = n_fft / 2;
         let n_freqs = n_fft / 2 + 1;
-        let len = samples.len() as isize;
+        let glen = base + samples.len();
+        let len = glen as isize;
 
         // Identical indexing to building the reflection-padded buffer explicitly:
-        // padded[i] = samples[(pad - i).min(len - 1)]        for i < pad
-        // padded[pad + len + j] = samples[len - 2 - j]        (saturating) for the right pad
+        // padded[i] = clip[(pad - i).min(glen - 1)]           for i < pad
+        // padded[pad + glen + j] = clip[glen - 2 - j]         (saturating) for the right pad
+        let at = |g: usize| -> f32 {
+            debug_assert!(g >= base, "sample {g} was trimmed (retained from {base})");
+            samples[g - base]
+        };
         let sample_at = |s: isize| -> f32 {
             if s < 0 {
-                samples[((-s) as usize).min(samples.len() - 1)]
+                at(((-s) as usize).min(glen - 1))
             } else if s < len {
-                samples[s as usize]
+                at(s as usize)
             } else {
                 debug_assert!(reflect_right, "frame reads past available samples");
-                samples[samples.len().saturating_sub(2 + (s - len) as usize)]
+                at(glen.saturating_sub(2 + (s - len) as usize))
             }
         };
 
@@ -211,7 +236,7 @@ impl VoxtralAudioProcessor {
         if num_frames == 0 {
             anyhow::bail!("Audio too short to produce mel frames");
         }
-        let data = engine.compute_frames(&padded, 0, num_frames, true);
+        let data = engine.compute_frames(&padded, 0, 0, num_frames, true);
 
         let tensor = Tensor::from_vec(data, (1, num_frames, self.num_mel_bins), device)?;
         Ok(tensor)
@@ -355,7 +380,7 @@ mod tests {
         whole.extend_from_slice(&speech);
         whole.extend(std::iter::repeat_n(0.0f32, N_RIGHT_PAD_TOKENS * spt));
         let total = engine.total_frames(whole.len());
-        let reference = engine.compute_frames(&whole, 0, total, true);
+        let reference = engine.compute_frames(&whole, 0, 0, total, true);
 
         // Streaming: start from the left pad, feed odd-sized chunks, compute only
         // frames that need no right reflection; at finish, append the right pad and
@@ -367,14 +392,73 @@ mod tests {
             buf.extend_from_slice(chunk);
             let ready = engine.ready_frames(buf.len());
             if ready > done {
-                streamed.extend(engine.compute_frames(&buf, done, ready, false));
+                streamed.extend(engine.compute_frames(&buf, 0, done, ready, false));
                 done = ready;
             }
         }
         buf.extend(std::iter::repeat_n(0.0f32, N_RIGHT_PAD_TOKENS * spt));
         let final_total = engine.total_frames(buf.len());
         assert_eq!(final_total, total);
-        streamed.extend(engine.compute_frames(&buf, done, final_total, true));
+        streamed.extend(engine.compute_frames(&buf, 0, done, final_total, true));
+
+        assert_eq!(streamed.len(), reference.len());
+        for (i, (a, b)) in streamed.iter().zip(reference.iter()).enumerate() {
+            assert!(a == b, "mel value diverged at flat index {i}: {a} vs {b}");
+        }
+    }
+
+    /// Streaming with the bounded sample buffer (samples trimmed to
+    /// [`MelFrameEngine::retained_from`] after every step) must remain
+    /// bit-identical to the whole-clip computation.
+    #[test]
+    fn incremental_mel_with_trimmed_samples_matches_whole_clip() {
+        let proc = processor();
+        let engine = proc.frame_engine().unwrap();
+        let spt = proc.samples_per_token();
+
+        let speech = synth_samples(21931);
+
+        let mut whole = vec![0.0f32; N_LEFT_PAD_TOKENS * spt];
+        whole.extend_from_slice(&speech);
+        whole.extend(std::iter::repeat_n(0.0f32, N_RIGHT_PAD_TOKENS * spt));
+        let total = engine.total_frames(whole.len());
+        let reference = engine.compute_frames(&whole, 0, 0, total, true);
+
+        // Streaming with a bounded buffer: after computing frames, drop every
+        // sample no future frame can read and track the base offset.
+        let mut buf = vec![0.0f32; N_LEFT_PAD_TOKENS * spt];
+        let mut base = 0usize;
+        let mut done = 0usize;
+        let mut streamed: Vec<f32> = Vec::new();
+        // Measured after each step's trim: the initial 32-token left pad is
+        // retained until the first frames are computed, but from then on the
+        // buffer must stay bounded by window + hop + one chunk.
+        let mut max_retained = 0usize;
+        for chunk in speech.chunks(1237) {
+            buf.extend_from_slice(chunk);
+            let ready = engine.ready_frames(base + buf.len());
+            if ready > done {
+                streamed.extend(engine.compute_frames(&buf, base, done, ready, false));
+                done = ready;
+            }
+            let keep_from = engine.retained_from(done);
+            if keep_from > base {
+                buf.drain(..keep_from - base);
+                base = keep_from;
+            }
+            max_retained = max_retained.max(buf.len());
+        }
+        buf.extend(std::iter::repeat_n(0.0f32, N_RIGHT_PAD_TOKENS * spt));
+        let final_total = engine.total_frames(base + buf.len());
+        assert_eq!(final_total, total);
+        streamed.extend(engine.compute_frames(&buf, base, done, final_total, true));
+
+        // The buffer stayed bounded (window + hop + one chunk + right pad, not
+        // the whole clip).
+        assert!(
+            max_retained < 8000,
+            "retained sample buffer grew to {max_retained}"
+        );
 
         assert_eq!(streamed.len(), reference.len());
         for (i, (a, b)) in streamed.iter().zip(reference.iter()).enumerate() {
