@@ -1320,6 +1320,10 @@ impl Pipeline for MultimodalPipeline {
         }
     }
 
+    fn multimodal_model(&self) -> Option<&(dyn MultimodalModel + Send + Sync)> {
+        Some(self.model.as_ref())
+    }
+
     fn attach_speculative(
         &mut self,
         config: crate::speculative::SpeculativeConfig,

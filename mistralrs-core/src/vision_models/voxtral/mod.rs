@@ -27,6 +27,7 @@ mod audio_processing;
 pub mod config;
 mod encoder;
 mod inputs_processor;
+pub(crate) mod realtime;
 
 pub(crate) use inputs_processor::VoxtralProcessor;
 
@@ -348,6 +349,8 @@ pub struct VoxtralModel {
     /// Precomputed audio embeddings [B, N_audio, dim] stored during prompt phase
     /// and retrieved at each generation step for per-position audio conditioning.
     audio_embeds_cache: Arc<Mutex<Option<Tensor>>>,
+    /// Audio front-end parameters, kept for the streaming ASR session.
+    audio_cfg: config::AudioEncodingArgs,
 }
 
 impl VoxtralModel {
@@ -493,7 +496,32 @@ impl VoxtralModel {
             ada_rms_norm_t_cond: cfg.ada_rms_norm_t_cond,
             dtype: vb.dtype(),
             audio_embeds_cache: Arc::new(Mutex::new(None)),
+            audio_cfg: cfg
+                .multimodal
+                .whisper_model_args
+                .encoder_args
+                .audio_encoding_args
+                .clone(),
         })
+    }
+
+    /// Audio front-end parameters (mel spectrogram configuration).
+    pub(crate) fn audio_encoding_args(&self) -> &config::AudioEncodingArgs {
+        &self.audio_cfg
+    }
+
+    /// Temporal adapter downsampling factor (encoder frames per audio embedding).
+    pub(crate) fn adapter_downsample_factor(&self) -> usize {
+        self.adapter.downsample_factor
+    }
+
+    /// Reset the decoder KV cache. The engine does this for whole-clip requests
+    /// via its cache manager; streaming ASR sessions drive the decoder directly
+    /// and call this at session start and finish.
+    pub(crate) fn reset_decoder_cache(&self) {
+        for kv in self.cache.normal().0.iter_mut() {
+            kv.reset();
+        }
     }
 
     fn inner_forward(
@@ -708,6 +736,10 @@ impl MultimodalModel for VoxtralModel {
 
     fn default_model_specific_args(&self, _input_ids: &Tensor) -> Box<dyn Any> {
         Box::new(VoxtralSpecificArgs::default())
+    }
+
+    fn as_voxtral(&self) -> Option<&VoxtralModel> {
+        Some(self)
     }
 
     fn reset_model_specific_state(&self) {

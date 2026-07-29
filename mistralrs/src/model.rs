@@ -1041,3 +1041,50 @@ impl Model {
             .map_err(|e| crate::error::Error::from(mistralrs_core::MistralRsError::Other(e)))
     }
 }
+
+impl Model {
+    /// Open a streaming ASR session on a loaded Voxtral Realtime model.
+    /// Errors if the loaded model is not Voxtral.
+    ///
+    /// Exactly one session may be active per loaded model at a time (the
+    /// model's caches are engine-global), and no other request may run against
+    /// the model while the session is active; the caller enforces both.
+    /// Opening a session resets the model's session state, so a crashed or
+    /// abandoned prior session cannot poison a new one.
+    pub async fn asr_stream(&self) -> anyhow::Result<AsrStream> {
+        let pipeline = self
+            .runner
+            .get_pipeline(None)
+            .map_err(|e| anyhow::anyhow!("failed to access the model pipeline: {e:?}"))?;
+        Ok(AsrStream {
+            inner: VoxtralAsrSession::new(pipeline).await?,
+        })
+    }
+}
+
+/// A streaming ASR session on a loaded Voxtral Realtime model.
+///
+/// Feed 16 kHz mono samples as they arrive with [`AsrStream::feed`]; each call
+/// returns the text the model newly committed. Call [`AsrStream::finish`] when
+/// the speaker stops to drain the remaining text and release the model.
+///
+/// For the same total sample stream, the concatenation of all [`AsrStream::feed`]
+/// deltas plus the [`AsrStream::finish`] tail reproduces the whole-clip
+/// transcription of the clip.
+pub struct AsrStream {
+    inner: VoxtralAsrSession,
+}
+
+impl AsrStream {
+    /// Append 16 kHz mono f32 samples as they arrive. Returns whatever text the
+    /// model newly committed, in order (possibly empty).
+    pub async fn feed(&mut self, pcm: &[f32]) -> anyhow::Result<String> {
+        self.inner.feed(pcm).await
+    }
+
+    /// The speaker stopped: append the right-pad silence, drain generation to
+    /// the cap, return the final tail text, and reset the model state.
+    pub async fn finish(self) -> anyhow::Result<String> {
+        self.inner.finish().await
+    }
+}

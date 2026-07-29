@@ -13,7 +13,7 @@ use mistralrs_quant::{QuantMethod, ShardedVarBuilder};
 pub struct VoxtralTemporalAdapter {
     pub(super) w_in: Arc<dyn QuantMethod>,
     pub(super) w_out: Arc<dyn QuantMethod>,
-    downsample_factor: usize,
+    pub(super) downsample_factor: usize,
 }
 
 impl VoxtralTemporalAdapter {

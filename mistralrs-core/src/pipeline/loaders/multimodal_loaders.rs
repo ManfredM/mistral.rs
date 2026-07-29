@@ -111,6 +111,11 @@ pub trait MultimodalModel:
     /// Reset model-specific state (e.g. cached audio embeddings) between requests.
     /// Called when the pipeline's non-granular state is reset.
     fn reset_model_specific_state(&self) {}
+    /// Downcast to the Voxtral Realtime model, if that is what this is.
+    /// Used by the streaming ASR session driver.
+    fn as_voxtral(&self) -> Option<&VoxtralModel> {
+        None
+    }
 }
 
 pub trait MultimodalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoader {

@@ -276,7 +276,11 @@ impl PastKvLenCache for ForwardMaskCache<'_> {
     }
 }
 
-pub(crate) struct ModelForwardContext<'a> {
+/// Per-forward execution context (positions, masks, cache handles).
+///
+/// The type is nameable outside the crate because public traits mention it,
+/// but all of its constructors and methods are crate-private.
+pub struct ModelForwardContext<'a> {
     cache: ForwardCache<'a>,
     positions: ForwardPositions<'a>,
     rope_positions: HashMap<(DeviceLocation, usize), Tensor>,
@@ -969,6 +973,13 @@ pub trait Pipeline:
         inputs: Box<dyn Any>,
         return_raw_logits: bool,
     ) -> Result<ForwardInputsResult, candle_core::Error>;
+
+    /// The underlying multimodal model, if this pipeline wraps one. Used by
+    /// model-specific session drivers (e.g. streaming ASR) that need to drive
+    /// the model directly while holding the pipeline lock.
+    fn multimodal_model(&self) -> Option<&(dyn MultimodalModel + Send + Sync)> {
+        None
+    }
 
     fn attach_speculative(
         &mut self,

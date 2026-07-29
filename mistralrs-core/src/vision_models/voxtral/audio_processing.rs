@@ -126,10 +126,6 @@ impl MelFrameEngine {
 
         out
     }
-
-    pub(super) fn num_mel_bins(&self) -> usize {
-        self.num_mel_bins
-    }
 }
 
 impl VoxtralAudioProcessor {

@@ -23,13 +23,13 @@ use super::config::VoxtralConfig;
 use super::VoxtralSpecificArgs;
 
 /// BOS token ID for Mistral tekken tokenizer.
-const BOS_TOKEN_ID: u32 = 1;
+pub(super) const BOS_TOKEN_ID: u32 = 1;
 /// [STREAMING_PAD] token ID (rank 32 in tekken special tokens).
-const STREAMING_PAD_TOKEN_ID: u32 = 32;
+pub(super) const STREAMING_PAD_TOKEN_ID: u32 = 32;
 /// Number of left-pad streaming tokens (from tekken.json audio config).
-const N_LEFT_PAD_TOKENS: usize = 32;
+pub(super) const N_LEFT_PAD_TOKENS: usize = 32;
 /// Number of delay tokens (transcription_delay_ms / frame_rate alignment).
-const N_DELAY_TOKENS: usize = 6;
+pub(super) const N_DELAY_TOKENS: usize = 6;
 
 pub struct VoxtralProcessor {
     audio_processor: VoxtralAudioProcessor,
@@ -45,7 +45,7 @@ impl VoxtralProcessor {
 }
 
 /// Audio output tokens per mel frame: conv stride (2) × adapter downsample (4).
-const AUDIO_LENGTH_PER_TOK: usize = 8;
+pub(super) const AUDIO_LENGTH_PER_TOK: usize = 8;
 /// Number of right-pad silence tokens added to audio (from audio_processing.rs).
 /// Subtracting from the generation cap prevents generating into silence region.
 const N_RIGHT_PAD_TOKENS: usize = 17;

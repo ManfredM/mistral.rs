@@ -142,6 +142,7 @@ pub use mistralrs_mcp::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
 pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
+pub use vision_models::voxtral::realtime::VoxtralAsrSession;
 pub use mistralrs_sandbox::{NetworkMode, SandboxPolicy};
 pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
 pub use pipeline::hf::{
@@ -1358,6 +1359,28 @@ impl MistralRs {
         }
 
         Err(MistralRsError::ModelNotFound(resolved_model_id))
+    }
+
+    /// Get the pipeline for a specific model. If `model_id` is `None`, uses the
+    /// default engine. Unlike [`Self::get_sender`], this does not auto-reload
+    /// unloaded models.
+    ///
+    /// This exposes the same pipeline the engine thread uses; callers that
+    /// drive it directly (e.g. streaming ASR sessions) must hold its lock for
+    /// the duration of each interaction and must not race in-flight requests.
+    pub fn get_pipeline(
+        &self,
+        model_id: Option<&str>,
+    ) -> Result<Arc<tokio::sync::Mutex<dyn Pipeline>>, MistralRsError> {
+        let resolved_model_id = self.resolve_alias_or_default(model_id)?;
+        let engines = self
+            .engines
+            .read()
+            .map_err(|_| MistralRsError::EnginePoisoned)?;
+        engines
+            .get(&resolved_model_id)
+            .map(|engine_instance| engine_instance.reboot_state.pipeline.clone())
+            .ok_or(MistralRsError::ModelNotFound(resolved_model_id))
     }
 
     /// Look up a file across all loaded engines. `None` if missing or expired.
