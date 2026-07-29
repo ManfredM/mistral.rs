@@ -105,6 +105,20 @@ impl EncoderAttention {
 
         let (k, v) = kv_cache.append(&k, &v)?;
 
+        // The mask is built from predicted cache accounting; if it ever
+        // disagrees with what the cache actually yielded, fail with the
+        // numbers instead of a bare broadcast error deep in attention.
+        if let AttentionMask::Custom(m) = attention_mask {
+            let k_len = k.dim(2)?;
+            let m_len = m.dim(candle_core::D::Minus1)?;
+            if m_len != k_len {
+                candle_core::bail!(
+                    "voxtral encoder mask width {m_len} != post-append key length {k_len} \
+                     (q_len {q_len}): sliding-window accounting bug"
+                );
+            }
+        }
+
         let attn_output = Sdpa.run_attention(
             &q,
             &k,
@@ -337,6 +351,11 @@ impl VoxtralEncoder {
         let (b_sz, seq_len, _dim) = xs.dims3()?;
 
         let mut cache = self.cache.lock().expect("Encoder cache lock poisoned");
+        // `RotatingCache::current_seq_len` is the TOTAL number of frames ever
+        // appended — it keeps growing past the sliding window and is never
+        // truncated by eviction — so it is the absolute stream position of the
+        // first new frame. That is exactly what RoPE needs: the same absolute,
+        // monotonic positions the text decoders pass via `seqlen_offsets`.
         let past = cache.0[0].current_seq_len();
 
         // Per-token RoPE positions: past..past+seq_len for each batch row.
@@ -346,17 +365,53 @@ impl VoxtralEncoder {
         }
         let positions = Tensor::from_vec(pos, b_sz * seq_len, xs.device())?;
 
-        // Create causal mask with sliding window for the encoder
-        let dummy_toks = Tensor::zeros((b_sz, seq_len), DType::U32, xs.device())?;
-        let attention_mask = CausalMasker.make_causal_mask(
-            &dummy_toks,
-            &cache.0 as &dyn PastKvLenCache,
-            xs.dtype(),
-            &CausalMaskConfig {
-                sliding_window: self.sliding_window,
-                ..Default::default()
-            },
-        )?;
+        let attention_mask = if seq_len == 1 {
+            // One query after an append sees exactly the retained window
+            // (the newest `min(past + 1, sw)` keys), which is precisely its
+            // visible set under the causal sliding window: no mask needed.
+            AttentionMask::None
+        } else if let Some(sw) = self.sliding_window {
+            // The mask must be as wide as the keys `KvCache::append` actually
+            // returns for this call. Once the window has saturated, the
+            // rotating cache's multi-token append returns
+            // `retained-before-append + new = min(past, sw) + seq_len` keys —
+            // NOT `past + seq_len`: frames older than the window are gone.
+            // `CausalMasker::make_swa_mask` assumes key column `j` sits at
+            // absolute position `j` (nothing evicted), so past saturation it
+            // is both too wide and mis-banded; build the band over the keys
+            // actually present instead. Below saturation
+            // (`retained_past == past`) this reduces to exactly that helper's
+            // mask, so whole-clip and early streaming behavior are unchanged.
+            let retained_past = past.min(sw);
+            let k_len = retained_past + seq_len;
+            // Absolute position of key column 0.
+            let oldest_k_pos = past - retained_past;
+            let mut mask = Vec::with_capacity(seq_len * k_len);
+            for i in 0..seq_len {
+                let q_pos = past + i;
+                for j in 0..k_len {
+                    let k_pos = oldest_k_pos + j;
+                    // Causal, with HF's exclusive lower bound
+                    // (`kv_idx > q_idx - sliding_window`): the token plus its
+                    // visible history total exactly `sw` positions.
+                    let visible = k_pos <= q_pos && q_pos - k_pos < sw;
+                    mask.push(if visible { 0f32 } else { f32::NEG_INFINITY });
+                }
+            }
+            AttentionMask::Custom(
+                Tensor::from_slice(&mask, (seq_len, k_len), xs.device())?.to_dtype(xs.dtype())?,
+            )
+        } else {
+            // No sliding window: nothing is ever evicted, the generic helper's
+            // key-position assumption holds.
+            let dummy_toks = Tensor::zeros((b_sz, seq_len), DType::U32, xs.device())?;
+            CausalMasker.make_causal_mask(
+                &dummy_toks,
+                &cache.0 as &dyn PastKvLenCache,
+                xs.dtype(),
+                &CausalMaskConfig::default(),
+            )?
+        };
 
         let mut hidden = xs.clone();
         for (i, layer) in self.layers.iter().enumerate() {

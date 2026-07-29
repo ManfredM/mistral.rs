@@ -60,7 +60,9 @@ pub struct VoxtralAsrSession {
     mel_flat: Vec<f32>,
     /// Number of mel frames in `mel_flat`.
     mel_done: usize,
-    /// Conv frames already pushed through the encoder transformer (== its KV length).
+    /// Conv frames already pushed through the encoder transformer (== the
+    /// total ever appended to its KV cache; the cache retains only the last
+    /// 750 once the sliding window saturates).
     conv_done: usize,
     /// Encoder output frames awaiting a complete adapter group of 4.
     enc_pending: Option<Tensor>,
