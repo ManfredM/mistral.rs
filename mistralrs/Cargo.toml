@@ -95,6 +95,10 @@ path = "examples/models/speech/main.rs"
 name = "asr"
 path = "examples/models/asr/main.rs"
 
+[[example]]
+name = "asr_streaming"
+path = "examples/asr_streaming/main.rs"
+
 # ========== Quantization ==========
 
 [[example]]
