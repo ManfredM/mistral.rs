@@ -322,10 +322,14 @@ impl VoxtralAsrSession {
             let tok = argmax_id(&logits)?;
             self.tokens_fed = N_PROMPT_TOKENS;
             self.prompt_fed = true;
-            if self.eos_toks.contains(&tok) {
+            if self.eos_toks.contains(&tok) && finish_cap.is_some() {
                 self.hit_eos = true;
                 return Ok(());
             }
+            // During streaming an EOS is an utterance boundary, not the end
+            // of dictation: it stays in the autoregressive context (the
+            // detokenizer skips special tokens, so it never becomes text)
+            // and decoding continues, so speech after a pause is heard.
             self.gen_ids.push(tok);
         }
 
@@ -349,10 +353,15 @@ impl VoxtralAsrSession {
             let logits = forward_ids(model, &[last], self.tokens_fed)?;
             let tok = argmax_id(&logits)?;
             self.tokens_fed += 1;
-            if self.eos_toks.contains(&tok) {
+            if self.eos_toks.contains(&tok) && finish_cap.is_some() {
+                // The speaker has stopped for good: the drain ends at the
+                // utterance end, exactly as whole-clip generation does.
                 self.hit_eos = true;
                 break;
             }
+            // Streaming: an utterance boundary stays in context, produces no
+            // text, and never ends the session (the owner's first real pause
+            // must not end dictation).
             self.gen_ids.push(tok);
         }
 
