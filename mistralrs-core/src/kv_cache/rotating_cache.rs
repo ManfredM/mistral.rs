@@ -23,9 +23,14 @@ pub struct RotatingCache {
     // Buffer index one past the newest token; the retained window ends here and slides
     // forward through slack capacity so appends avoid shifting the window every token.
     pub write_pos: usize,
-    // The full K/V tensor returned by the last `append()` call.
-    // During prefill this may be larger than the internal buffer (retained + new),
-    // which is what shared KV layers need for correct attention.
+    // The `src` tensor of the last `append()` call, kept only for speculative
+    // rollback (`accepted_append_from_batched_append` reads a prefix of it).
+    // `None` after a window-covering append (`seq_len > max_seq_len`): such an
+    // append cannot be rolled back (`can_append_from_snapshot` refuses it), and
+    // retaining the full prompt K/V here held every sliding layer's prefill
+    // K/V alive for the whole first token, linearly in prompt length
+    // (papyrus#346). Consumers that need the full K/V of an append use the
+    // `append()` return value, which is unchanged.
     pub last_append_result: Option<Tensor>,
 }
 
@@ -128,10 +133,11 @@ impl RotatingCache {
             );
         }
         let per_row = dim0 / batch_len;
-        let retained_len = snapshot.current_seq_len.min(snapshot.max_seq_len);
+        // `last_append_result` stores the append's `src` tensor, so the
+        // accepted tokens are its prefix (src-relative, offset 0).
         appended
             .narrow(0, row_idx * per_row, per_row)?
-            .narrow(snapshot.dim, retained_len, accepted_len)?
+            .narrow(snapshot.dim, 0, accepted_len)?
             .contiguous()
             .map(Some)
     }
@@ -343,7 +349,15 @@ impl RotatingCache {
             ad.narrow(self.dim, self.window_start(), self.retained_len())?
         };
 
-        self.last_append_result = Some(result.clone());
+        // Keep only what rollback can read: the src prefix of a rollback-able
+        // append. A window-covering append cannot be rolled back, and storing
+        // its (full-prompt-sized) tensors would retain every sliding layer's
+        // prefill K/V until the next append (papyrus#346).
+        self.last_append_result = if seq_len > self.max_seq_len {
+            None
+        } else {
+            Some(src.contiguous()?)
+        };
         Ok(result)
     }
 }
@@ -390,6 +404,26 @@ mod tests {
             current.flatten_all()?.to_vec1::<f32>()?,
             vec![2., 3., 4., 5.]
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_retain_window_covering_appends() -> candle_core::Result<()> {
+        // papyrus#346: a prompt append that covers the whole window used to
+        // store the full (retained + new) prefill K/V in the cache, holding
+        // every sliding layer's prefill tensors alive until the next append —
+        // linear in prompt length. Such an append cannot be rolled back, so
+        // nothing may be retained for it.
+        let mut cache = RotatingCache::new(2, 4, 4);
+        let _ = cache.append(&make_src(&[0., 1., 2., 3., 4., 5.])?)?;
+        assert!(cache.last_append_result().is_none());
+
+        // A rollback-able append retains only its own `src`, not the window
+        // prefix it was concatenated with for the attention return value.
+        let _ = cache.append(&make_src(&[6., 7.])?)?;
+        let stored = cache.last_append_result().unwrap();
+        assert_eq!(stored.flatten_all()?.to_vec1::<f32>()?, vec![6., 7.]);
 
         Ok(())
     }

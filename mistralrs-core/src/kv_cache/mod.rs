@@ -117,15 +117,18 @@ impl KvCache {
 
     /// Return the K tensor from the last `append()` call.
     ///
-    /// For Normal caches this is identical to `k()`. For Rotating caches it
-    /// returns the full (retained + new) tensor that `append()` produced,
-    /// which during prefill may be larger than the internal sliding-window
-    /// buffer returned by `k()`.  Shared KV layers must use this instead of
-    /// `k()` so they see the same K/V the donor used for its own attention.
+    /// For Normal caches this is identical to `k()`. Shared KV layers read
+    /// their donor through this so they see the same K/V the donor used for
+    /// its own attention. Every donor in the tree owns a Normal cache (models
+    /// promote sliding donors, e.g. gemma4); Rotating caches no longer retain
+    /// their append result (papyrus#346), so a rotating donor would silently
+    /// attend to truncated K/V — bail instead so it fails fast.
     pub fn appended_k(&self) -> Result<Option<Tensor>> {
         match self {
             Self::Normal { k, .. } => k.current_data(),
-            Self::Rotating { k, .. } => Ok(k.last_append_result().cloned()),
+            Self::Rotating { .. } => candle_core::bail!(
+                "appended_k on a sliding-window cache: promote KV-sharing donors to a full cache"
+            ),
             Self::Shared { .. } => Ok(None),
         }
     }
@@ -134,7 +137,9 @@ impl KvCache {
     pub fn appended_v(&self) -> Result<Option<Tensor>> {
         match self {
             Self::Normal { v, .. } => v.current_data(),
-            Self::Rotating { v, .. } => Ok(v.last_append_result().cloned()),
+            Self::Rotating { .. } => candle_core::bail!(
+                "appended_v on a sliding-window cache: promote KV-sharing donors to a full cache"
+            ),
             Self::Shared { .. } => Ok(None),
         }
     }
@@ -1626,7 +1631,9 @@ fn try_kv_append_rotating_metal(
 
     kc.current_seq_len += src_seq;
     vc.current_seq_len += src_seq;
-    kc.last_append_result = Some(k_dst.clone());
-    vc.last_append_result = Some(v_dst.clone());
+    // Same storage contract as `RotatingCache::append`: the rollback reader
+    // expects the append's `src`, not the (circular) window buffer.
+    kc.last_append_result = Some(k_src.clone());
+    vc.last_append_result = Some(v_src.clone());
     Ok(Some((k_dst, v_dst)))
 }
