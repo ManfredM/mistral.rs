@@ -2098,11 +2098,13 @@ impl TextModel {
                 },
             )?;
             let is_first = ctx.is_first_prompt_chunk();
+            // No CPU staging here: `DeviceMappedMask::new` replicates the mask
+            // to every mapped device itself, staging through the host only for
+            // device pairs that need it. Reading an N×N prefill mask back to
+            // host RAM first doubled the per-request memory transient for long
+            // prompts and was dead work on a single-device run.
             let attention_mask = if is_first || is_paged_prefill_chunk {
-                match attention_mask {
-                    AttentionMask::Custom(m) => AttentionMask::Custom(m.to_device(&Device::Cpu)?),
-                    other => other,
-                }
+                attention_mask
             } else {
                 AttentionMask::None
             };
@@ -2116,10 +2118,7 @@ impl TextModel {
                 },
             )?;
             let sliding_attention_mask = if is_first || is_paged_prefill_chunk {
-                match sliding_attention_mask {
-                    AttentionMask::Custom(m) => AttentionMask::Custom(m.to_device(&Device::Cpu)?),
-                    other => other,
-                }
+                sliding_attention_mask
             } else {
                 AttentionMask::None
             };

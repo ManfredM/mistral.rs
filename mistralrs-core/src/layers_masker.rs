@@ -79,10 +79,13 @@ impl PastKvLenCache for Vec<Option<(Tensor, Tensor)>> {
 impl CausalMasker {
     fn make_mask(&self, tgt_len: usize, past_kv_len: usize, device: &Device) -> Result<Tensor> {
         let offset = tgt_len + past_kv_len;
-        let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| (0..offset).map(move |j| u8::from(j + tgt_len > i + offset)))
-            .collect();
-        Tensor::from_slice(&mask, (tgt_len, offset), device)
+        // Built with device ops rather than a host `Vec`: an unchunked prefill
+        // makes this tgt_len × offset, and materializing O(N²) elements on the
+        // host was the dominant per-request RAM transient for long prompts.
+        // Masked iff `j > i + past_kv_len`.
+        let rows = Tensor::arange(past_kv_len as u32, offset as u32, device)?.unsqueeze(1)?;
+        let cols = Tensor::arange(0u32, offset as u32, device)?.unsqueeze(0)?;
+        cols.broadcast_gt(&rows)
     }
 
     fn make_mask_chunked(
@@ -130,24 +133,34 @@ impl CausalMasker {
         dtype: DType,
     ) -> Result<Tensor> {
         let total_kv_len = tgt_len + past_kv_len;
-        let mask: Vec<_> = (0..tgt_len)
-            .flat_map(|i| {
-                let q_pos = past_kv_len + i;
-                (0..total_kv_len).map(move |j| {
-                    // HF's sliding causal mask uses an exclusive lower bound
-                    // (`kv_idx > q_idx - sliding_window`), so the current
-                    // token plus its visible history total exactly
-                    // `sliding_window` positions.
-                    let too_old = q_pos >= sliding_window && j <= q_pos - sliding_window;
-                    if j > q_pos || too_old {
-                        f32::NEG_INFINITY
-                    } else {
-                        0.
-                    }
-                })
-            })
-            .collect();
-        Tensor::from_slice(&mask, (tgt_len, total_kv_len), device)?.to_dtype(dtype)
+        // Built with device ops rather than a host `Vec`: an unchunked prefill
+        // makes this tgt_len × total_kv_len, and the previous host-side f32
+        // buffer (4·N² bytes, before its own dtype narrowing) was the largest
+        // single share of the per-request RAM transient for long prompts.
+        //
+        // HF's sliding causal mask uses an exclusive lower bound
+        // (`kv_idx > q_idx - sliding_window`), so the current token plus its
+        // visible history total exactly `sliding_window` positions. A key at
+        // `j` is masked for the query at `q_pos = past_kv_len + i` iff
+        // `j > q_pos` (future) or `j + sliding_window <= q_pos` (too old);
+        // the two conditions are disjoint, so their sum is exactly 0 or 1.
+        let rows =
+            Tensor::arange(past_kv_len as u32, total_kv_len as u32, device)?.unsqueeze(1)?;
+        let cols = Tensor::arange(0u32, total_kv_len as u32, device)?.unsqueeze(0)?;
+        let future = cols.broadcast_gt(&rows)?;
+        let too_old = Tensor::arange(
+            sliding_window as u32,
+            (total_kv_len + sliding_window) as u32,
+            device,
+        )?
+        .unsqueeze(0)?
+        .broadcast_le(&rows)?;
+        let masked = (future + too_old)?;
+        let shape = (tgt_len, total_kv_len);
+        masked.where_cond(
+            &Tensor::full(f32::NEG_INFINITY, shape, device)?.to_dtype(dtype)?,
+            &Tensor::zeros(shape, dtype, device)?,
+        )
     }
 
     /// Expands a mask from (bs, seq_len) to (bs, 1, tgt_len, seq_len)
@@ -355,6 +368,58 @@ mod tests {
                 vec![false, false, false, true, true],
             ]
         );
+        Ok(())
+    }
+
+    /// The device-op mask builders must agree element-for-element with the
+    /// scalar definitions they replaced (the replacement exists because the
+    /// host-side `Vec`s were O(N²) of per-request RAM on unchunked prefills).
+    #[test]
+    fn device_built_masks_match_the_scalar_definitions() -> Result<()> {
+        let device = Device::Cpu;
+        for (tgt_len, past_kv_len, sliding_window) in [
+            (1, 0, 4),
+            (2, 3, 2),
+            (7, 0, 3),
+            (7, 5, 3),
+            (16, 0, 16),
+            (16, 9, 4),
+            (33, 31, 8),
+        ] {
+            let causal = CausalMasker
+                .make_mask(tgt_len, past_kv_len, &device)?
+                .to_vec2::<u8>()?;
+            let offset = tgt_len + past_kv_len;
+            for i in 0..tgt_len {
+                for j in 0..offset {
+                    assert_eq!(
+                        causal[i][j],
+                        u8::from(j + tgt_len > i + offset),
+                        "causal ({tgt_len},{past_kv_len}) at [{i}][{j}]"
+                    );
+                }
+            }
+
+            let swa = CausalMasker.make_swa_mask(
+                tgt_len,
+                past_kv_len,
+                sliding_window,
+                &device,
+                DType::F32,
+            )?;
+            let visible = finite_rows(&swa)?;
+            for (i, row) in visible.iter().enumerate() {
+                let q_pos = past_kv_len + i;
+                for (j, seen) in row.iter().enumerate() {
+                    let too_old = q_pos >= sliding_window && j <= q_pos - sliding_window;
+                    assert_eq!(
+                        *seen,
+                        !(j > q_pos || too_old),
+                        "swa ({tgt_len},{past_kv_len},{sliding_window}) at [{i}][{j}]"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
