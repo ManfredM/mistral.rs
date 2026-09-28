@@ -1076,6 +1076,18 @@ pub struct AsrStream {
 }
 
 impl AsrStream {
+    /// Nominal audio-token spans; choose timed mode from the first feed.
+    pub async fn feed_timed(
+        &mut self,
+        pcm: &[f32],
+    ) -> anyhow::Result<Vec<mistralrs_core::TimedAsrText>> {
+        self.inner.feed_timed(pcm).await
+    }
+
+    pub async fn finish_timed(self) -> anyhow::Result<Vec<mistralrs_core::TimedAsrText>> {
+        self.inner.finish_timed().await
+    }
+
     /// Append 16 kHz mono f32 samples as they arrive. Returns whatever text the
     /// model newly committed, in order (possibly empty).
     pub async fn feed(&mut self, pcm: &[f32]) -> anyhow::Result<String> {
