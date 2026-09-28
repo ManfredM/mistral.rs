@@ -96,6 +96,10 @@ name = "asr"
 path = "examples/models/asr/main.rs"
 
 [[example]]
+name = "asr_timing"
+path = "examples/asr_timing/main.rs"
+
+[[example]]
 name = "asr_streaming"
 path = "examples/asr_streaming/main.rs"
 

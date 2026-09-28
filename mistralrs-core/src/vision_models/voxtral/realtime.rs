@@ -48,6 +48,14 @@ use super::{AudioEmbedStore, VoxtralModel, VoxtralSpecificArgs};
 /// Decoder prompt length: `[BOS]` + `(32 left-pad + 6 delay)` streaming pads.
 const N_PROMPT_TOKENS: usize = 1 + N_LEFT_PAD_TOKENS + N_DELAY_TOKENS;
 
+/// A committed text fragment and its optional nominal audio span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimedAsrText {
+    pub text: String,
+    /// Nominal 16 kHz audio positions, not forced-aligned word boundaries.
+    pub samples: Option<std::ops::Range<usize>>,
+}
+
 /// A streaming ASR session on a loaded Voxtral Realtime model.
 ///
 /// Exactly one session may exist per loaded model at a time: the session owns
@@ -62,6 +70,10 @@ pub struct VoxtralAsrSession {
     mel_engine: MelFrameEngine,
     num_mel_bins: usize,
     samples_per_token: usize,
+    real_samples: usize,
+    timed: bool,
+    timed_cursor: usize,
+    timed_output: Vec<TimedAsrText>,
     /// Retained raw 16 kHz mono samples: the bounded suffix of the global
     /// stream that future mel frames can still read (`samples[0]` is global
     /// sample index `samples_base`). The stream starts with the 32-token left
@@ -173,6 +185,10 @@ impl VoxtralAsrSession {
             mel_engine,
             num_mel_bins,
             samples_per_token,
+            real_samples: 0,
+            timed: false,
+            timed_cursor: 0,
+            timed_output: Vec::new(),
             samples: vec![0.0f32; N_LEFT_PAD_TOKENS * samples_per_token],
             samples_base: 0,
             mel_done: 0,
@@ -192,10 +208,18 @@ impl VoxtralAsrSession {
     /// Append 16 kHz mono f32 samples as they arrive. Returns whatever text the
     /// model newly committed, in order (possibly empty).
     pub async fn feed(&mut self, pcm: &[f32]) -> Result<String> {
+        if self.timed {
+            return Err(anyhow!("cannot change ASR timing mode during a session"));
+        }
+        self.feed_inner(pcm).await
+    }
+
+    async fn feed_inner(&mut self, pcm: &[f32]) -> Result<String> {
         let pipeline = Arc::clone(&self.pipeline);
         let guard = pipeline.lock().await;
         let model = voxtral_of(&*guard)?;
 
+        self.real_samples += pcm.len();
         self.samples.extend_from_slice(pcm);
         let new_mel = self.advance_mel(false);
         self.advance_encoder(model, new_mel)?;
@@ -210,12 +234,42 @@ impl VoxtralAsrSession {
         {
             store.evict_below(self.tokens_fed);
         }
-        self.take_delta()
+        if self.timed {
+            Ok(String::new())
+        } else {
+            self.take_delta()
+        }
     }
 
     /// The speaker stopped: append the right-pad silence, drain generation to
     /// the whole-clip cap, return the final tail text, and reset the model state.
     pub async fn finish(mut self) -> Result<String> {
+        if self.timed {
+            return Err(anyhow!("cannot change ASR timing mode during a session"));
+        }
+        self.finish_inner().await
+    }
+
+    /// Emits per-token nominal audio spans; select this API before the first feed.
+    pub async fn feed_timed(&mut self, pcm: &[f32]) -> Result<Vec<TimedAsrText>> {
+        if !self.timed && self.real_samples != 0 {
+            return Err(anyhow!("cannot change ASR timing mode during a session"));
+        }
+        self.timed = true;
+        self.feed_inner(pcm).await?;
+        Ok(std::mem::take(&mut self.timed_output))
+    }
+
+    pub async fn finish_timed(mut self) -> Result<Vec<TimedAsrText>> {
+        if !self.timed && self.real_samples != 0 {
+            return Err(anyhow!("cannot change ASR timing mode during a session"));
+        }
+        self.timed = true;
+        self.finish_inner().await?;
+        Ok(std::mem::take(&mut self.timed_output))
+    }
+
+    async fn finish_inner(&mut self) -> Result<String> {
         let pipeline = Arc::clone(&self.pipeline);
         let guard = pipeline.lock().await;
         let model = voxtral_of(&*guard)?;
@@ -234,6 +288,9 @@ impl VoxtralAsrSession {
             .saturating_sub(N_RIGHT_PAD_TOKENS);
         self.advance_decoder(model, Some(cap))?;
 
+        if self.timed {
+            self.capture_timed_delta(true)?;
+        }
         let tail = self.take_delta()?;
 
         // Leave the model clean for whatever runs next.
@@ -370,6 +427,7 @@ impl VoxtralAsrSession {
             // detokenizer skips special tokens, so it never becomes text)
             // and decoding continues, so speech after a pause is heard.
             self.gen_ids.push(tok);
+            self.capture_timed_delta(false)?;
         }
 
         loop {
@@ -402,8 +460,34 @@ impl VoxtralAsrSession {
             // text, and never ends the session (the owner's first real pause
             // must not end dictation).
             self.gen_ids.push(tok);
+            self.capture_timed_delta(false)?;
         }
 
+        Ok(())
+    }
+
+    fn capture_timed_delta(&mut self, final_flush: bool) -> Result<()> {
+        if !self.timed {
+            return Ok(());
+        }
+        let incomplete = self.decode_from(self.win_start)?.ends_with('\u{fffd}');
+        if incomplete && !final_flush {
+            return Ok(());
+        }
+        let text = self.take_delta()?;
+        let range = nominal_span(
+            self.timed_cursor,
+            self.gen_ids.len(),
+            self.samples_per_token,
+            self.real_samples,
+        );
+        self.timed_cursor = self.gen_ids.len();
+        if !text.is_empty() {
+            self.timed_output.push(TimedAsrText {
+                text,
+                samples: if incomplete { None } else { range },
+            });
+        }
         Ok(())
     }
 
@@ -467,5 +551,31 @@ impl VoxtralAsrSession {
             .decode(&self.gen_ids[from..], true)
             .map_err(|e| anyhow!("detokenization failed: {e}"))
             .context("decoding streaming ASR output")
+    }
+}
+
+fn nominal_span(
+    start: usize,
+    end: usize,
+    stride: usize,
+    real: usize,
+) -> Option<std::ops::Range<usize>> {
+    let start = start.checked_mul(stride)?;
+    let end = end.checked_mul(stride)?.min(real);
+    (start < end).then_some(start..end)
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::nominal_span;
+    #[test]
+    fn nominal_positions_exclude_padding_and_clip_tail() {
+        assert_eq!(nominal_span(0, 1, 1280, 16000), Some(0..1280));
+        assert_eq!(nominal_span(2, 5, 1280, 16000), Some(2560..6400));
+        assert_eq!(nominal_span(12, 13, 1280, 16000), Some(15360..16000));
+        assert_eq!(nominal_span(13, 14, 1280, 16000), None);
+        assert_eq!(nominal_span(0, 0, 1280, 16000), None);
+        assert_eq!(nominal_span(0, 1, 1280, 0), None);
+        assert_eq!(nominal_span(usize::MAX, usize::MAX, 1280, 16000), None);
     }
 }
