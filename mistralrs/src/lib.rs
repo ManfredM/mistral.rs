@@ -359,4 +359,4 @@ pub use mistralrs_macros::tool;
 // Re-export schemars for use in tool definitions
 pub use schemars;
 
-pub use mistralrs_core::TimedAsrText;
+pub use mistralrs_core::{AsrStepCounts, TimedAsrText};

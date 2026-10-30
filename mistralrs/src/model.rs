@@ -1099,4 +1099,10 @@ impl AsrStream {
     pub async fn finish(self) -> anyhow::Result<String> {
         self.inner.finish().await
     }
+
+    /// What the decoder produced so far: text, "nothing yet" pads, and
+    /// utterance boundaries, one step per 80 ms of audio.
+    pub fn step_counts(&self) -> mistralrs_core::AsrStepCounts {
+        self.inner.step_counts()
+    }
 }

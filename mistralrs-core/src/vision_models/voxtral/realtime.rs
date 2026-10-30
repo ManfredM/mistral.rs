@@ -100,6 +100,19 @@ pub struct VoxtralAsrSession {
     /// the text already emitted for ids at or after `win_start`.
     win_start: usize,
     emitted_win: String,
+    /// What every generated step produced, by kind (see [`AsrStepCounts`]).
+    steps: AsrStepCounts,
+}
+
+/// What a streaming session's decoder produced so far, one step per 80 ms
+/// audio token: text, a streaming pad ("nothing yet"), or an utterance
+/// boundary. A session that hears speech yet keeps producing only pads is
+/// stuck; the counts let a caller see that without reading any text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsrStepCounts {
+    pub text: u64,
+    pub pad: u64,
+    pub boundary: u64,
 }
 
 fn voxtral_of(pipeline: &dyn Pipeline) -> Result<&VoxtralModel> {
@@ -200,6 +213,7 @@ impl VoxtralAsrSession {
             tokens_fed: 0,
             gen_ids: Vec::new(),
             hit_eos: false,
+            steps: AsrStepCounts::default(),
             win_start: 0,
             emitted_win: String::new(),
         })
@@ -426,6 +440,7 @@ impl VoxtralAsrSession {
             // of dictation: it stays in the autoregressive context (the
             // detokenizer skips special tokens, so it never becomes text)
             // and decoding continues, so speech after a pause is heard.
+            self.count_step(tok);
             self.gen_ids.push(tok);
             self.capture_timed_delta(false)?;
         }
@@ -459,11 +474,27 @@ impl VoxtralAsrSession {
             // Streaming: an utterance boundary stays in context, produces no
             // text, and never ends the session (the owner's first real pause
             // must not end dictation).
+            self.count_step(tok);
             self.gen_ids.push(tok);
             self.capture_timed_delta(false)?;
         }
 
         Ok(())
+    }
+
+    fn count_step(&mut self, tok: u32) {
+        if tok == STREAMING_PAD_TOKEN_ID {
+            self.steps.pad += 1;
+        } else if self.eos_toks.contains(&tok) {
+            self.steps.boundary += 1;
+        } else {
+            self.steps.text += 1;
+        }
+    }
+
+    /// What the decoder produced so far, by kind.
+    pub fn step_counts(&self) -> AsrStepCounts {
+        self.steps
     }
 
     fn capture_timed_delta(&mut self, final_flush: bool) -> Result<()> {
