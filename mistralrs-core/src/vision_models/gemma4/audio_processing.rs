@@ -1,7 +1,6 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use mistralrs_audio::AudioInput;
-use rubato::Resampler;
 use rustfft::{num_complex::Complex32, FftPlanner};
 
 use crate::vision_models::preprocessor_config::PreProcessorConfig;
@@ -334,45 +333,13 @@ impl AudioProcessor {
 
         let expected_len = samples.len() * to_rate as usize / from_rate as usize;
 
-        let sinc = rubato::SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: rubato::SincInterpolationType::Linear,
-            oversampling_factor: 256,
-            window: rubato::WindowFunction::BlackmanHarris2,
-        };
+        let mut result = crate::utils::resample::resample_mono(samples, from_rate, to_rate)?;
+        result.truncate(expected_len);
 
-        let mut resampler = rubato::SincFixedIn::<f32>::new(
-            to_rate as f64 / from_rate as f64,
-            2.0,
-            sinc,
-            samples.len(),
-            1,
-        )?;
-
-        let delay = resampler.output_delay();
-        let mut result = resampler.process(&[samples.to_vec()], None)?[0].clone();
-        let target_len_with_delay = expected_len + delay;
-
-        while result.len() < target_len_with_delay {
-            let flushed = resampler.process_partial::<Vec<f32>>(None, None)?;
-            let tail = &flushed[0];
-            if tail.is_empty() {
-                break;
-            }
-            result.extend_from_slice(tail);
-        }
-
-        if result.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Rubato exposes the filter latency via `output_delay()`, but trimming
-        // it here shifts the waveform earlier than HF's audio loading path
-        // (`librosa`/`soxr`) and causes the downstream Gemma4 mel frames to
-        // drift. For HF parity we keep the leading samples and only truncate
-        // to the expected resampled length.
-        Ok(result.drain(..expected_len.min(result.len())).collect())
+        // `resample_mono` starts at the first input sample, like HF's audio
+        // loading path (`librosa`/`soxr`); only truncate to the expected
+        // resampled length so the Gemma4 mel frames do not drift.
+        Ok(result)
     }
 
     fn create_mel_filterbank(

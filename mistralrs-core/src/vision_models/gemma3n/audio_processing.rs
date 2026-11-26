@@ -1,7 +1,6 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 use mistralrs_audio::AudioInput;
-use rubato::Resampler;
 use rustfft::{num_complex::Complex32, FftPlanner};
 
 use crate::vision_models::preprocessor_config::PreProcessorConfig;
@@ -124,25 +123,7 @@ impl AudioProcessor {
             return Ok(samples.to_vec());
         }
 
-        let sinc = rubato::SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: rubato::SincInterpolationType::Linear,
-            oversampling_factor: 256,
-            window: rubato::WindowFunction::BlackmanHarris2,
-        };
-
-        let mut resampler = rubato::SincFixedIn::<f32>::new(
-            to_rate as f64 / from_rate as f64,
-            2.0,
-            sinc,
-            samples.len(),
-            1,
-        )?;
-
-        let samples_vec = vec![samples.to_vec()];
-        let result = resampler.process(&samples_vec, None)?;
-        Ok(result[0].clone())
+        crate::utils::resample::resample_mono(samples, from_rate, to_rate)
     }
 
     #[allow(dead_code)]

@@ -5,13 +5,13 @@ use mistralrs_core::{run_doctor as run_doctor_report, DoctorStatus};
 
 pub fn run_doctor(json: bool) -> Result<()> {
     if json {
-        let report = run_doctor_report();
+        let report = run_doctor_report()?;
         let out = serde_json::to_string_pretty(&report)?;
         println!("{out}");
         return Ok(());
     }
 
-    let report = run_doctor_report();
+    let report = run_doctor_report()?;
     let system = &report.system;
 
     // Header

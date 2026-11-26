@@ -440,7 +440,11 @@ fn finish_job(
 }
 
 fn default_host_budget() -> usize {
-    let mut sys = System::new();
+    // Without a memory reading the budget does not throttle, as when the
+    // reading does not fit in `usize`.
+    let Ok(mut sys) = System::new() else {
+        return usize::MAX;
+    };
     sys.refresh_memory();
     let available = usize::try_from(sys.available_memory()).unwrap_or(usize::MAX);
     available

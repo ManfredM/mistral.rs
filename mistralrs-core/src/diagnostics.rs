@@ -261,8 +261,9 @@ fn detect_cpu_extensions() -> (bool, bool, bool, bool) {
     }
 }
 
-pub fn collect_system_info() -> SystemInfo {
-    let mut sys = System::new_all();
+pub fn collect_system_info() -> anyhow::Result<SystemInfo> {
+    let mut sys = System::new_all()
+        .map_err(|e| anyhow::anyhow!("cannot read this computer's system information: {e}"))?;
     sys.refresh_all();
 
     let (avx, avx2, avx512, fma) = detect_cpu_extensions();
@@ -270,7 +271,7 @@ pub fn collect_system_info() -> SystemInfo {
     let cpu = CpuInfo {
         brand: sys.cpus().first().map(|c| c.brand().to_string()),
         logical_cores: sys.cpus().len(),
-        physical_cores: System::physical_core_count(),
+        physical_cores: System::physical_core_count().ok(),
         avx,
         avx2,
         avx512,
@@ -285,15 +286,15 @@ pub fn collect_system_info() -> SystemInfo {
     let hf_cache = Cache::from_env();
     let hf_cache_path = hf_cache.path().to_string_lossy().to_string();
 
-    SystemInfo {
-        os: System::name(),
-        kernel: System::kernel_version(),
+    Ok(SystemInfo {
+        os: System::name().ok(),
+        kernel: System::kernel_version().ok(),
         cpu,
         memory,
         devices: collect_devices(&sys),
         build: build_info(),
         hf_cache_path: Some(hf_cache_path),
-    }
+    })
 }
 
 /// Check HuggingFace connectivity and token validity by accessing a gated model
@@ -360,9 +361,9 @@ pub fn check_hf_gated_access() -> HfConnectivityInfo {
 }
 
 fn disk_usage_for(path: &Path) -> Option<(u64, u64)> {
-    let disks = Disks::new_with_refreshed_list();
+    let disks = Disks::new_with_refreshed_list().ok()?;
     let mut best: Option<(usize, u64, u64)> = None;
-    for disk in disks.list() {
+    for disk in disks.iter() {
         let mount = disk.mount_point();
         if path.starts_with(mount) {
             let len = mount.as_os_str().len();
@@ -403,8 +404,8 @@ fn cuda_version_code_to_string(code: u32) -> String {
     format!("{}.{}", code / 100, code % 100)
 }
 
-pub fn run_doctor() -> DoctorReport {
-    let system = collect_system_info();
+pub fn run_doctor() -> anyhow::Result<DoctorReport> {
+    let system = collect_system_info()?;
     let mut checks = Vec::new();
 
     // CPU extensions check (ARM-aware)
@@ -739,5 +740,5 @@ pub fn run_doctor() -> DoctorReport {
         });
     }
 
-    DoctorReport { system, checks }
+    Ok(DoctorReport { system, checks })
 }

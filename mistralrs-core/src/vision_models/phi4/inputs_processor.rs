@@ -10,9 +10,6 @@ use regex::Regex;
 use tokenizers::Tokenizer;
 
 use apodize::hanning_iter;
-use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
-};
 use rustfft::{num_complex::Complex32, FftPlanner};
 
 use crate::{
@@ -505,57 +502,15 @@ impl Phi4MMInputsProcessor {
         // Handle 8kHz upsampling case
         if fs == 8000 && self.eightk_method == "resample" {
             // Upsample to 16kHz using rubato
-            let params = SincInterpolationParameters {
-                sinc_len: 256,
-                f_cutoff: 0.95,
-                interpolation: SincInterpolationType::Linear,
-                oversampling_factor: 256,
-                window: WindowFunction::BlackmanHarris2,
-            };
-
-            let mut resampler = SincFixedIn::<f32>::new(
-                2.0, // resample ratio (16000/8000)
-                2.0,
-                params,
-                wav.len(),
-                1, // mono
-            )
-            .map_err(|e| candle_core::Error::Msg(format!("Resampler creation failed: {e}")))?;
-
-            let input = vec![wav.to_vec()];
-            let output = resampler
-                .process(&input, None)
+            let output = crate::utils::resample::resample_mono(wav, fs, 16000)
                 .map_err(|e| candle_core::Error::Msg(format!("Resampling failed: {e}")))?;
-
-            return Ok((output[0].clone(), 16000));
+            return Ok((output, 16000));
         }
 
         // Regular downsampling
-        let resample_ratio = target_fs as f64 / fs as f64;
-
-        let params = SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 256,
-            window: WindowFunction::BlackmanHarris2,
-        };
-
-        let mut resampler = SincFixedIn::<f32>::new(
-            resample_ratio,
-            2.0,
-            params,
-            wav.len(),
-            1, // mono
-        )
-        .map_err(|e| candle_core::Error::Msg(format!("Resampler creation failed: {e}")))?;
-
-        let input = vec![wav.to_vec()];
-        let output = resampler
-            .process(&input, None)
+        let output = crate::utils::resample::resample_mono(wav, fs, target_fs)
             .map_err(|e| candle_core::Error::Msg(format!("Resampling failed: {e}")))?;
-
-        Ok((output[0].clone(), target_fs))
+        Ok((output, target_fs))
     }
 
     fn extract_mel_spectrogram_rustfft(&self, wav: &[f32], fs: u32) -> Result<Vec<Vec<f32>>> {

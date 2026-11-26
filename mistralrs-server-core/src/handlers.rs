@@ -109,8 +109,10 @@ pub async fn health() -> &'static str {
   path = "/v1/system/info",
   responses((status = 200, description = "Host, device, and build information"))
 )]
-pub async fn system_info() -> Json<mistralrs_core::SystemInfo> {
-    Json(collect_system_info())
+pub async fn system_info() -> Result<Json<mistralrs_core::SystemInfo>, (StatusCode, String)> {
+    collect_system_info()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 #[utoipa::path(
@@ -119,8 +121,10 @@ pub async fn system_info() -> Json<mistralrs_core::SystemInfo> {
   path = "/v1/system/doctor",
   responses((status = 200, description = "Environment diagnostics report"))
 )]
-pub async fn system_doctor() -> Json<mistralrs_core::DoctorReport> {
-    Json(run_doctor())
+pub async fn system_doctor() -> Result<Json<mistralrs_core::DoctorReport>, (StatusCode, String)> {
+    run_doctor()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
